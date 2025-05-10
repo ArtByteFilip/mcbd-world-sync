@@ -1,6 +1,6 @@
 mod network;
 
-use anyhow::{Result, Context};
+use anyhow::Result;
 use notify::{Watcher, RecursiveMode, Event, RecommendedWatcher, Config};
 use std::path::Path;
 use std::sync::mpsc::channel;

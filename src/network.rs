@@ -4,7 +4,8 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use futures::{SinkExt, StreamExt};
 use serde::{Serialize, Deserialize};
 use std::path::PathBuf;
-use log::{info, error, warn};
+use log::{info, error};
+use tokio_util::bytes::Bytes;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum SyncMessage {
@@ -57,7 +58,7 @@ impl SyncServer {
                                 info!("Received file change: {} - {}", path.display(), change_type);
                                 // TODO: Handle file change
                             }
-                            SyncMessage::FileContent { path, content } => {
+                            SyncMessage::FileContent { path, content: _ } => {
                                 info!("Received file content for: {}", path.display());
                                 // TODO: Save file content
                             }
@@ -101,7 +102,7 @@ impl SyncClient {
         // Send initial sync request
         let sync_request = SyncMessage::SyncRequest;
         let bytes = serde_json::to_vec(&sync_request)?;
-        framed.send(bytes).await?;
+        framed.send(Bytes::from(bytes)).await?;
 
         Ok(())
     }
@@ -112,7 +113,7 @@ impl SyncClient {
 
         let message = SyncMessage::FileChange { path, change_type };
         let bytes = serde_json::to_vec(&message)?;
-        framed.send(bytes).await?;
+        framed.send(Bytes::from(bytes)).await?;
 
         Ok(())
     }
