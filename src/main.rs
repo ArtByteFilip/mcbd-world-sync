@@ -1,7 +1,9 @@
 mod network;
+mod config;
+mod file_manager;
 
 use anyhow::Result;
-use notify::{Watcher, RecursiveMode, Event, RecommendedWatcher, Config};
+use notify::{Watcher, RecursiveMode, Event, RecommendedWatcher, Config as NotifyConfig};
 use std::path::Path;
 use std::sync::mpsc::channel;
 use std::time::Duration;
@@ -10,6 +12,11 @@ use std::fs;
 use std::env;
 use network::{SyncServer, SyncClient};
 use std::path::PathBuf;
+use config::Config as AppConfig;
+use file_manager::{FileManager, FileInfo};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use std::time::SystemTime;
 
 fn get_username() -> String {
     // Try different environment variables and methods to get the username
@@ -46,19 +53,51 @@ fn list_worlds(path: &Path) {
         Ok(entries) => {
             let mut found_worlds = false;
             for entry in entries {
-                if let Ok(entry) = entry {
-                    if let Ok(metadata) = entry.metadata() {
-                        if metadata.is_dir() {
-                            found_worlds = true;
-                            info!("Found world: {}", entry.path().display());
-                            // List contents of the world directory
-                            if let Ok(world_entries) = fs::read_dir(entry.path()) {
-                                for world_entry in world_entries {
-                                    if let Ok(world_entry) = world_entry {
-                                        debug!("  - {}", world_entry.path().display());
+                match entry {
+                    Ok(entry) => {
+                        match entry.metadata() {
+                            Ok(metadata) => {
+                                if metadata.is_dir() {
+                                    found_worlds = true;
+                                    info!("Found world: {}", entry.path().display());
+                                    // List contents of the world directory
+                                    match fs::read_dir(entry.path()) {
+                                        Ok(world_entries) => {
+                                            for world_entry in world_entries {
+                                                match world_entry {
+                                                    Ok(world_entry) => {
+                                                        debug!("  - {}", world_entry.path().display());
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("Could not read world entry: {}", e);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                                                error!("Access denied to world directory. Please run the program as administrator.");
+                                            } else {
+                                                warn!("Could not read world directory: {}", e);
+                                            }
+                                        }
                                     }
                                 }
                             }
+                            Err(e) => {
+                                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                                    error!("Access denied to world metadata. Please run the program as administrator.");
+                                } else {
+                                    warn!("Could not read metadata: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::PermissionDenied {
+                            error!("Access denied to directory entry. Please run the program as administrator.");
+                        } else {
+                            warn!("Could not read directory entry: {}", e);
                         }
                     }
                 }
@@ -67,7 +106,13 @@ fn list_worlds(path: &Path) {
                 warn!("No Minecraft worlds found in the directory");
             }
         }
-        Err(e) => warn!("Could not read worlds directory: {}", e),
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                error!("Access denied to worlds directory. Please run the program as administrator.");
+            } else {
+                warn!("Could not read worlds directory: {}", e);
+            }
+        }
     }
 }
 
@@ -78,10 +123,19 @@ async fn main() -> Result<()> {
     env_logger::init();
     
     info!("Starting Minecraft Bedrock World Sync");
-    info!("Current working directory: {:?}", env::current_dir()?);
+    info!("Note: This program requires administrator privileges to access Minecraft files.");
 
+    // Load configuration
+    let config = AppConfig::load()?;
+    info!("Configuration loaded");
+
+    // Initialize file manager
+    let file_manager = Arc::new(Mutex::new(FileManager::new(PathBuf::from(&config.paths.minecraft_worlds))));
+    
     // Start sync server
-    let server = SyncServer::new(8080);
+    let server = SyncServer::new(config.server.port);
+    let _file_manager_clone = file_manager.clone();
+    
     tokio::spawn(async move {
         if let Err(e) = server.start().await {
             error!("Server error: {}", e);
@@ -92,7 +146,7 @@ async fn main() -> Result<()> {
     let (tx, rx) = channel();
 
     // Create a watcher object, delivering debounced events
-    let mut watcher = RecommendedWatcher::new(tx, Config::default().with_poll_interval(Duration::from_secs(2)))?;
+    let mut watcher = RecommendedWatcher::new(tx, NotifyConfig::default().with_poll_interval(Duration::from_secs(2)))?;
 
     // Try each possible path
     for path in get_minecraft_paths() {
@@ -105,9 +159,30 @@ async fn main() -> Result<()> {
             // List worlds immediately
             list_worlds(worlds_path);
 
+            // Initial scan of files
+            let mut file_manager_guard = file_manager.lock().await;
+            match file_manager_guard.scan_directory() {
+                Ok(files) => {
+                    info!("Found {} files to sync", files.len());
+                }
+                Err(e) => {
+                    if e.to_string().contains("Access is denied") {
+                        error!("Access denied during initial scan. Please run the program as administrator.");
+                    } else {
+                        error!("Error during initial scan: {}", e);
+                    }
+                    continue;
+                }
+            }
+            drop(file_manager_guard);
+
             info!("Watching directory for changes: {}", worlds_path.display());
             if let Err(e) = watcher.watch(worlds_path, RecursiveMode::Recursive) {
-                error!("Failed to watch directory: {}", e);
+                if e.to_string().contains("Access is denied") {
+                    error!("Access denied to watch directory. Please run the program as administrator.");
+                } else {
+                    error!("Failed to watch directory: {}", e);
+                }
                 continue;
             }
 
@@ -118,13 +193,53 @@ async fn main() -> Result<()> {
                         for path in paths {
                             info!("Change detected: {:?} - {:?}", kind, path);
                             
+                            // Update file info
+                            let mut file_manager_guard = file_manager.lock().await;
+                            match fs::metadata(&path) {
+                                Ok(metadata) => {
+                                    match path.strip_prefix(worlds_path) {
+                                        Ok(relative_path) => {
+                                            match file_manager_guard.calculate_file_hash(&path) {
+                                                Ok(hash) => {
+                                                    let file_info = FileInfo {
+                                                        path: relative_path.to_path_buf(),
+                                                        last_modified: metadata.modified()?,
+                                                        size: metadata.len(),
+                                                        hash,
+                                                    };
+                                                    file_manager_guard.update_file_info(relative_path.to_path_buf(), file_info);
+                                                }
+                                                Err(e) => {
+                                                    if e.to_string().contains("Access is denied") {
+                                                        error!("Access denied to calculate file hash. Please run the program as administrator.");
+                                                    } else {
+                                                        error!("Failed to calculate file hash: {}", e);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => error!("Failed to get relative path: {}", e),
+                                    }
+                                }
+                                Err(e) => {
+                                    if e.kind() == std::io::ErrorKind::PermissionDenied {
+                                        error!("Access denied to file metadata. Please run the program as administrator.");
+                                    } else {
+                                        error!("Failed to get file metadata: {}", e);
+                                    }
+                                }
+                            }
+                            drop(file_manager_guard);
+
                             // Send change to other devices
-                            let client = SyncClient::new("127.0.0.1:8080".to_string());
-                            if let Err(e) = client.send_file_change(
-                                PathBuf::from(path),
-                                format!("{:?}", kind)
-                            ).await {
-                                error!("Failed to send change: {}", e);
+                            for device in &config.sync.devices {
+                                let client = SyncClient::new(device.address.clone());
+                                if let Err(e) = client.send_file_change(
+                                    PathBuf::from(path.strip_prefix(worlds_path)?),
+                                    format!("{:?}", kind)
+                                ).await {
+                                    error!("Failed to send change to {}: {}", device.name, e);
+                                }
                             }
 
                             // List worlds again after change

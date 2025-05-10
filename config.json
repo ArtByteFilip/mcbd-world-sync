@@ -1,0 +1,19 @@
+{
+    "server": {
+        "port": 8080,
+        "host": "0.0.0.0"
+    },
+    "sync": {
+        "devices": [
+            {
+                "name": "local",
+                "address": "127.0.0.1:8080"
+            }
+        ],
+        "conflict_resolution": "newest",
+        "sync_interval": 60
+    },
+    "paths": {
+        "minecraft_worlds": "C:\\Users\\Filip\\AppData\\Local\\Packages\\Microsoft.MinecraftUWP_8wekyb3d8bbwe\\LocalState\\games\\com.mojang\\minecraftWorlds"
+    }
+} 
